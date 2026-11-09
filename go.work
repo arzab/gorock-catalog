@@ -1,0 +1,11 @@
+go 1.26.0
+
+use (
+	./rockbun
+	./rockbus
+	./rockcron
+	./rockfiber
+	./rocklog
+	./rockredis
+	./rocktelebot
+)
