@@ -5,6 +5,7 @@ use (
 	./rockbus
 	./rockcron
 	./rockfiber
+	./rockhttp
 	./rocklog
 	./rockredis
 	./rocktelebot
