@@ -34,7 +34,7 @@ var ErrPanic = errors.New("rockcron: job panic")
 //	    &SyncCacheJob{repo: repo},
 //	    &DailyReportJob{db: db},
 //	)
-//	engine.MustRegister("cron", app, rockengine.RestartPolicy{})
+//	rockengine.New(map[string]rockengine.App{"cron": app}).Run(ctx, "cron")
 type App struct {
 	cfg     Config
 	onError func(ctx context.Context, job Job, err error)
