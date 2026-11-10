@@ -49,12 +49,12 @@ func bind(r *http.Request, in any, maxBody int64) error {
 	case ct == "multipart/form-data":
 		r.Body = http.MaxBytesReader(nil, r.Body, maxBody)
 		if err := r.ParseMultipartForm(defaultMaxMemory); err != nil {
-			return rockhandlers.Invalid("invalid multipart form: %v", err)
+			return rockhandlers.Invalid("invalid multipart form").Wrap(err)
 		}
 	case ct == "application/x-www-form-urlencoded":
 		r.Body = http.MaxBytesReader(nil, r.Body, maxBody)
 		if err := r.ParseForm(); err != nil {
-			return rockhandlers.Invalid("invalid form: %v", err)
+			return rockhandlers.Invalid("invalid form").Wrap(err)
 		}
 	}
 
@@ -91,21 +91,21 @@ func bindFields(r *http.Request, s reflect.Value) error {
 		if name := sf.Tag.Get("query"); name != "" {
 			if vals, ok := r.URL.Query()[name]; ok {
 				if err := setValues(f, vals); err != nil {
-					return rockhandlers.Invalid("query %q: %v", name, err)
+					return paramError("query", name, err)
 				}
 			}
 		}
 		if name := sf.Tag.Get("header"); name != "" {
 			if vals := r.Header.Values(name); len(vals) > 0 {
 				if err := setValues(f, vals); err != nil {
-					return rockhandlers.Invalid("header %q: %v", name, err)
+					return paramError("header", name, err)
 				}
 			}
 		}
 		if name := sf.Tag.Get("path"); name != "" {
 			if val := r.PathValue(name); val != "" {
 				if err := setValues(f, []string{val}); err != nil {
-					return rockhandlers.Invalid("path %q: %v", name, err)
+					return paramError("path", name, err)
 				}
 			}
 		}
@@ -120,9 +120,49 @@ func decodeJSON(r *http.Request, in any, maxBody int64) error {
 		if errors.As(err, &tooBig) {
 			return rockhandlers.Invalid("request body is larger than %d bytes", tooBig.Limit)
 		}
-		return rockhandlers.Invalid("invalid JSON body: %v", err)
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) && typeErr.Field != "" {
+			return rockhandlers.Invalid("invalid JSON body").
+				WithFields(map[string]string{typeErr.Field: "must be " + jsonKind(typeErr.Type)}).Wrap(err)
+		}
+		// The decoder's text names Go types: it stays in the cause, for logs.
+		return rockhandlers.Invalid("invalid JSON body").Wrap(err)
 	}
 	return nil
+}
+
+// jsonKind names a Go type the way a JSON client thinks of it.
+func jsonKind(t reflect.Type) string {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Bool:
+		return "a boolean"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return "a number"
+	case reflect.String:
+		return "a string"
+	case reflect.Slice, reflect.Array:
+		return "an array"
+	default:
+		return "an object"
+	}
+}
+
+// errUnsupported marks a Params field type the binder cannot fill: a bug in
+// the Params, not in the request.
+var errUnsupported = errors.New("rockhttp: unsupported field type")
+
+// paramError reports a bad query, header, path or form value as Invalid with
+// the field in Fields, or an unsupported field type as Internal.
+func paramError(source, name string, err error) error {
+	if errors.Is(err, errUnsupported) {
+		return &rockhandlers.Error{Kind: rockhandlers.KindInternal, Err: fmt.Errorf("%s %q: %w", source, name, err)}
+	}
+	return rockhandlers.Invalid("invalid %s", source).WithFields(map[string]string{name: err.Error()})
 }
 
 func bindForm(r *http.Request, f reflect.Value, name string) error {
@@ -147,7 +187,7 @@ func bindForm(r *http.Request, f reflect.Value, name string) error {
 	}
 	if vals, ok := r.Form[name]; ok {
 		if err := setValues(f, vals); err != nil {
-			return rockhandlers.Invalid("form %q: %v", name, err)
+			return paramError("form", name, err)
 		}
 	}
 	return nil
@@ -181,7 +221,7 @@ func setString(f reflect.Value, v string) error {
 	if f.Type() == durationType {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return fmt.Errorf("%q is not a duration", v)
+			return errors.New("must be a duration such as 5s")
 		}
 		f.SetInt(int64(d))
 		return nil
@@ -192,29 +232,29 @@ func setString(f reflect.Value, v string) error {
 	case reflect.Bool:
 		b, err := strconv.ParseBool(v)
 		if err != nil {
-			return fmt.Errorf("%q is not a bool", v)
+			return errors.New("must be true or false")
 		}
 		f.SetBool(b)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, f.Type().Bits())
 		if err != nil {
-			return fmt.Errorf("%q is not an integer", v)
+			return errors.New("must be an integer")
 		}
 		f.SetInt(n)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		n, err := strconv.ParseUint(strings.TrimSpace(v), 10, f.Type().Bits())
 		if err != nil {
-			return fmt.Errorf("%q is not an unsigned integer", v)
+			return errors.New("must be a non-negative integer")
 		}
 		f.SetUint(n)
 	case reflect.Float32, reflect.Float64:
 		n, err := strconv.ParseFloat(strings.TrimSpace(v), f.Type().Bits())
 		if err != nil {
-			return fmt.Errorf("%q is not a number", v)
+			return errors.New("must be a number")
 		}
 		f.SetFloat(n)
 	default:
-		return fmt.Errorf("unsupported field type %s", f.Type())
+		return fmt.Errorf("%w %s", errUnsupported, f.Type())
 	}
 	return nil
 }
