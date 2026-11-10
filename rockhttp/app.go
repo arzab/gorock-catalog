@@ -51,8 +51,8 @@ func New(cfg Config, endpoints ...Endpoint) *App {
 	return &App{cfg: cfg, endpoints: endpoints}
 }
 
-// Use adds rockhandlers middlewares around every endpoint (outermost first).
-// Call it before Init.
+// Use adds rockhandlers middlewares in front of every endpoint's chain
+// (the first one runs first). Call it before Init.
 func (a *App) Use(mws ...rockhandlers.Middleware) *App {
 	a.mws = append(a.mws, mws...)
 	return a
@@ -65,7 +65,7 @@ func (a *App) Init(context.Context) (err error) {
 		return errors.New("rockhttp: Port must not be empty")
 	}
 	mux := http.NewServeMux()
-	defer func() { // ServeMux and Route.With panic on bad input
+	defer func() { // ServeMux panics on bad or conflicting patterns
 		if r := recover(); r != nil {
 			err = fmt.Errorf("rockhttp: %v", r)
 		}
@@ -75,13 +75,13 @@ func (a *App) Init(context.Context) (err error) {
 		prefix = ""
 	}
 	for i, ep := range a.endpoints {
-		if ep.Method == "" || ep.Path == "" || ep.Handler.ParamsType() == nil {
+		if ep.Method == "" || ep.Path == "" || ep.Handler == nil {
 			return fmt.Errorf("rockhttp: endpoint %d (%s %s): Method, Path and Handler are required", i, ep.Method, ep.Path)
 		}
-		route := ep.Handler.With(a.mws...)
-		status := ep.Status
+		pipeline := ep.Handler.Use(a.mws...)
+		name, status := ep.Method+" "+ep.Path, ep.Status
 		mux.HandleFunc(ep.Method+" "+prefix+ep.Path, func(w http.ResponseWriter, r *http.Request) {
-			a.serve(w, r, route, status)
+			a.serve(w, r, pipeline, name, status)
 		})
 	}
 
@@ -102,24 +102,24 @@ func (a *App) Init(context.Context) (err error) {
 	return nil
 }
 
-// serve: run the chain (binding is its fill link) → write the result or the error.
-func (a *App) serve(w http.ResponseWriter, r *http.Request, route rockhandlers.Route, status int) {
+// serve: run the chain (binding is its fill step) → write the response or the error.
+func (a *App) serve(w http.ResponseWriter, r *http.Request, pipeline *rockhandlers.Pipeline, name string, status int) {
 	ctx := withExchange(r.Context(), r)
 	defer func() { // the chain never panics; this guards writing the response
 		if v := recover(); v != nil {
 			err := &rockhandlers.Error{Kind: rockhandlers.KindInternal, Err: &rockhandlers.PanicError{Value: v, Stack: debug.Stack()}}
-			a.report(r, route.Name(), err)
+			a.report(r, name, err)
 		}
 	}()
 
 	maxBody := a.maxBody()
-	res, err := route.Serve(ctx, func(params any) error { return bind(r, params, maxBody) })
+	res, err := pipeline.Run(ctx, func(params rockhandlers.Params) error { return bind(r, params, maxBody) })
 	if err != nil {
 		a.writeError(ctx, w, err)
 		return
 	}
 	if err := writeResult(ctx, w, res, status); err != nil {
-		a.report(r, route.Name(), err) // headers may be sent already: only report
+		a.report(r, name, err) // headers may be sent already: only report
 	}
 }
 

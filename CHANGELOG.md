@@ -4,6 +4,16 @@ All modules are versioned together with [gorock-kit](https://github.com/arzab/go
 
 ## Unreleased
 
+## v0.6.0 — 2026-11-10
+
+Works with gorock-kit `v0.6.0`.
+
+### ⚠️ Changes that need action
+
+| Module | Change | What to do |
+|---|---|---|
+| rockhttp | On the Fiber-style rockhandlers: `Endpoint.Handler` is a `*rockhandlers.Pipeline` (`rockhandlers.Chain(handlers...)`); handlers are `func(c *rockhandlers.Ctx, params P, response R) error`; `File` and `Redirect` are responses. A chain without handlers answers `501 Not Implemented`. | Rewrite handlers as in the gorock-kit v0.6.0 migration table; `Handler: rockhandlers.Chain(...)` stays the same in `Endpoint`. |
+
 ## v0.5.0 — 2026-11-10
 
 First tagged release of the catalog.

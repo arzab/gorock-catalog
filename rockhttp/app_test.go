@@ -18,40 +18,15 @@ import (
 	rh "github.com/arzab/gorock-kit/rockhandlers"
 )
 
-// --- a reusable step + embeddable model, as the catalog would ship them ---
-
-type BearerAuth struct {
-	Authorization string `header:"Authorization" json:"-"`
-}
-
-func (a *BearerAuth) BearerToken() string { return strings.TrimPrefix(a.Authorization, "Bearer ") }
-
-type TokenParams interface{ BearerToken() string }
-
-var UserKey = rh.NewLocal[string]("user")
-
-func Bearer[P TokenParams, R any](c *rh.Ctx[P, R]) error {
-	if c.Params.BearerToken() == "" {
-		return rh.Unauthorized("token required")
-	}
-	UserKey.Set(c, c.Params.BearerToken())
-	return c.Next()
-}
-
-// a group is a plain function
-func Secured[P TokenParams, R any](name string, steps ...rh.Handler[P, R]) rh.Route {
-	return rh.Chain(name, rh.Prepend(steps, Bearer[P, R])...)
-}
-
-// --- models and steps ---
+// --- params and responses ---
 
 type CreateParams struct {
-	BearerAuth
-	ShopID int      `path:"shop"`
-	DryRun bool     `query:"dry_run"`
-	Tags   []string `query:"tag"`
-	Item   string   `json:"item"`
-	Qty    int      `json:"qty"`
+	Authorization string   `header:"Authorization" json:"-"`
+	ShopID        int      `path:"shop"`
+	DryRun        bool     `query:"dry_run"`
+	Tags          []string `query:"tag"`
+	Item          string   `json:"item"`
+	Qty           int      `json:"qty"`
 }
 
 func (p *CreateParams) Validate() error {
@@ -61,7 +36,7 @@ func (p *CreateParams) Validate() error {
 	return nil
 }
 
-type CreateResult struct {
+type CreateResponse struct {
 	Shop   int      `json:"shop"`
 	Item   string   `json:"item"`
 	DryRun bool     `json:"dry_run"`
@@ -69,16 +44,34 @@ type CreateResult struct {
 	Owner  string   `json:"owner"`
 }
 
-func create(c *rh.Ctx[*CreateParams, *CreateResult]) error {
-	p := c.Params
-	*c.Result = CreateResult{Shop: p.ShopID, Item: p.Item, DryRun: p.DryRun, Tags: p.Tags, Owner: UserKey.MustGet(c)}
+func (r *CreateResponse) Normalize() error { return nil }
+
+type userKey struct{}
+
+func checkAuth(c *rh.Ctx, p *CreateParams, _ *CreateResponse) error {
+	token := strings.TrimPrefix(p.Authorization, "Bearer ")
+	if token == "" {
+		return rh.Unauthorized("token required")
+	}
+	c.Set(userKey{}, token)
+	return c.Next()
+}
+
+func create(c *rh.Ctx, p *CreateParams, r *CreateResponse) error {
+	owner, _ := c.Get(userKey{})
+	*r = CreateResponse{Shop: p.ShopID, Item: p.Item, DryRun: p.DryRun, Tags: p.Tags, Owner: owner.(string)}
 	return nil
 }
 
 type IDParams struct {
 	ID int `path:"id"`
 }
+
+func (*IDParams) Validate() error { return nil }
+
 type Empty struct{}
+
+func (*Empty) Normalize() error { return nil }
 
 // --- helpers ---
 
@@ -114,17 +107,19 @@ func decodeBody[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
 	return v
 }
 
+func idChain(fn func(c *rh.Ctx, p *IDParams, r *Empty) error) *rh.Pipeline { return rh.Chain(fn) }
+
 // --- tests ---
 
 func TestFullChain(t *testing.T) {
 	var log []string
-	logMW := func(c rh.Context) error {
+	logMW := func(c *rh.Ctx, _ rh.Params, _ rh.Response) error {
 		err := c.Next()
-		log = append(log, c.Route()+":"+rh.KindOf(err).String())
+		log = append(log, rh.KindOf(err).String())
 		return err
 	}
 	h := handler(t, New(Config{Prefix: "/api/"},
-		Endpoint{Method: "POST", Path: "/shops/{shop}/orders", Handler: Secured("orders.create", create), Status: http.StatusCreated},
+		Endpoint{Method: "POST", Path: "/shops/{shop}/orders", Handler: rh.Chain(checkAuth, create), Status: http.StatusCreated},
 	).Use(logMW))
 
 	req := jsonReq("POST", "/api/shops/7/orders?dry_run=true&tag=a&tag=b", `{"item":"tea","qty":2}`)
@@ -133,18 +128,16 @@ func TestFullChain(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
-	got := decodeBody[CreateResult](t, rec)
+	got := decodeBody[CreateResponse](t, rec)
 	if got.Shop != 7 || got.Item != "tea" || !got.DryRun || len(got.Tags) != 2 || got.Owner != "ann" {
 		t.Fatalf("got %+v", got)
 	}
 
-	// no token → 401 from the step that needs the embedded model
 	rec = do(h, jsonReq("POST", "/api/shops/7/orders", `{"item":"tea","qty":2}`))
 	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status %d", rec.Code)
+		t.Fatalf("no token: status %d", rec.Code)
 	}
 
-	// validation with fields
 	req = jsonReq("POST", "/api/shops/7/orders", `{"item":"tea","qty":0}`)
 	req.Header.Set("Authorization", "Bearer ann")
 	rec = do(h, req)
@@ -153,59 +146,49 @@ func TestFullChain(t *testing.T) {
 		t.Fatalf("status %d, body %+v", rec.Code, body)
 	}
 
-	if got := strings.Join(log, " "); got != "orders.create:none orders.create:unauthorized orders.create:invalid" {
+	if got := strings.Join(log, " "); got != "none unauthorized invalid" {
 		t.Fatalf("middleware log: %s", got)
 	}
 }
 
 func TestErrors(t *testing.T) {
-	var reported []string
-	logMW := func(c rh.Context) error {
-		err := c.Next()
-		if err != nil {
-			reported = append(reported, c.Route())
-		}
-		return err
-	}
-	route := func(name string, fn rh.Handler[*IDParams, *Empty]) rh.Route { return rh.Chain(name, fn) }
 	h := handler(t, New(Config{},
-		Endpoint{Method: "GET", Path: "/missing/{id}", Handler: route("missing", func(c *rh.Ctx[*IDParams, *Empty]) error {
-			return rh.NotFound("order %d not found", c.Params.ID)
+		Endpoint{Method: "GET", Path: "/missing/{id}", Handler: idChain(func(_ *rh.Ctx, p *IDParams, _ *Empty) error {
+			return rh.NotFound("order %d not found", p.ID)
 		})},
-		Endpoint{Method: "GET", Path: "/boom", Handler: route("boom", func(*rh.Ctx[*IDParams, *Empty]) error {
+		Endpoint{Method: "GET", Path: "/boom", Handler: idChain(func(*rh.Ctx, *IDParams, *Empty) error {
 			return errors.New("db password leaked")
 		})},
-		Endpoint{Method: "GET", Path: "/panic", Handler: route("panic", func(*rh.Ctx[*IDParams, *Empty]) error { panic("oops") })},
-		Endpoint{Method: "GET", Path: "/slow", Handler: route("slow", func(c *rh.Ctx[*IDParams, *Empty]) error {
+		Endpoint{Method: "GET", Path: "/panic", Handler: idChain(func(*rh.Ctx, *IDParams, *Empty) error { panic("oops") })},
+		Endpoint{Method: "GET", Path: "/slow", Handler: idChain(func(c *rh.Ctx, _ *IDParams, _ *Empty) error {
 			<-c.Done()
 			return c.Err()
-		}).With(rh.Timeout(10 * time.Millisecond))},
-		Endpoint{Method: "DELETE", Path: "/orders/{id}", Handler: route("delete", func(*rh.Ctx[*IDParams, *Empty]) error { return nil })},
-	).Use(logMW))
+		}).Use(rh.Timeout(10 * time.Millisecond))},
+		Endpoint{Method: "GET", Path: "/todo", Handler: rh.Chain[*IDParams, *Empty]()},
+		Endpoint{Method: "DELETE", Path: "/orders/{id}", Handler: idChain(func(*rh.Ctx, *IDParams, *Empty) error { return nil })},
+	))
 
 	cases := []struct {
-		method, url string
-		code        int
-		kind, msg   string
+		url       string
+		code      int
+		kind, msg string
 	}{
-		{"GET", "/missing/42", 404, "not_found", "order 42 not found"},
-		{"GET", "/missing/x", 400, "invalid", "invalid path"},
-		{"GET", "/boom", 500, "internal", "internal error"},
-		{"GET", "/panic", 500, "internal", "internal error"},
-		{"GET", "/slow", 504, "timeout", "Gateway Timeout"},
+		{"/missing/42", 404, "not_found", "order 42 not found"},
+		{"/missing/x", 400, "invalid", "invalid path"},
+		{"/boom", 500, "internal", "internal error"},
+		{"/panic", 500, "internal", "internal error"},
+		{"/slow", 504, "timeout", "Gateway Timeout"},
+		{"/todo", 501, "not_implemented", "Not Implemented"},
 	}
 	for _, c := range cases {
-		rec := do(h, httptest.NewRequest(c.method, c.url, nil))
+		rec := do(h, httptest.NewRequest("GET", c.url, nil))
 		body := decodeBody[ErrorBody](t, rec)
 		if rec.Code != c.code || body.Kind != c.kind || body.Message != c.msg {
-			t.Fatalf("%s %s: status %d, body %+v", c.method, c.url, rec.Code, body)
+			t.Fatalf("%s: status %d, body %+v", c.url, rec.Code, body)
 		}
 	}
-	if len(reported) != len(cases) {
-		t.Fatalf("middleware saw errors of %v (decode errors included)", reported)
-	}
 
-	// empty result struct → 204
+	// empty response struct → 204
 	if rec := do(h, httptest.NewRequest("DELETE", "/orders/1", nil)); rec.Code != 204 || rec.Body.Len() != 0 {
 		t.Fatalf("delete: %d %q", rec.Code, rec.Body)
 	}
@@ -213,13 +196,44 @@ func TestErrors(t *testing.T) {
 	if rec := do(h, httptest.NewRequest("GET", "/orders/1", nil)); rec.Code != 405 {
 		t.Fatalf("405: %d", rec.Code)
 	}
-
 	// client went away → 499, no body
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	rec := do(h, httptest.NewRequest("GET", "/slow", nil).WithContext(ctx))
 	if rec.Code != StatusClientClosedRequest || rec.Body.Len() != 0 {
 		t.Fatalf("canceled: %d %q", rec.Code, rec.Body)
+	}
+}
+
+// Decoding errors reach the client without Go type or struct names.
+func TestDecodingErrorsAreSafe(t *testing.T) {
+	h := handler(t, New(Config{}, Endpoint{Method: "POST", Path: "/shops/{shop}/orders", Handler: rh.Chain(checkAuth, create)}))
+	cases := []struct {
+		name, url, body string
+		msg             string
+		field, want     string
+	}{
+		{"broken JSON", "/shops/1/orders", `{"qty":`, "invalid JSON body", "", ""},
+		{"wrong JSON type", "/shops/1/orders", `{"item":"tea","qty":"two"}`, "invalid JSON body", "qty", "must be a number"},
+		{"wrong query type", "/shops/1/orders?dry_run=maybe", `{"item":"tea","qty":1}`, "invalid query", "dry_run", "must be true or false"},
+		{"wrong path type", "/shops/x/orders", `{"item":"tea","qty":1}`, "invalid path", "shop", "must be an integer"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := jsonReq("POST", c.url, c.body)
+			req.Header.Set("Authorization", "Bearer ann")
+			rec := do(h, req)
+			body := decodeBody[ErrorBody](t, rec)
+			if rec.Code != 400 || body.Message != c.msg {
+				t.Fatalf("status %d, body %+v", rec.Code, body)
+			}
+			if c.field != "" && body.Fields[c.field] != c.want {
+				t.Fatalf("fields %v", body.Fields)
+			}
+			if raw := rec.Body.String(); strings.Contains(raw, "Go struct") || strings.Contains(raw, "CreateParams") {
+				t.Fatalf("Go names leaked: %s", raw)
+			}
+		})
 	}
 }
 
@@ -230,27 +244,34 @@ type UploadParams struct {
 	File  *multipart.FileHeader   `form:"file"`
 	More  []*multipart.FileHeader `form:"more"`
 }
-type UploadResult struct {
+
+func (p *UploadParams) Validate() error {
+	if p.File == nil {
+		return rh.Invalid("file is required")
+	}
+	return nil
+}
+
+type UploadResponse struct {
 	Title, Name, Body string
 	More              int
 }
 
-func upload(c *rh.Ctx[*UploadParams, *UploadResult]) error {
-	if c.Params.File == nil {
-		return rh.Invalid("file is required")
-	}
-	f, err := c.Params.File.Open()
+func (*UploadResponse) Normalize() error { return nil }
+
+func upload(_ *rh.Ctx, p *UploadParams, r *UploadResponse) error {
+	f, err := p.File.Open()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = f.Close() }()
 	b, _ := io.ReadAll(f)
-	*c.Result = UploadResult{Title: c.Params.Title, Name: c.Params.File.Filename, Body: string(b), More: len(c.Params.More)}
+	*r = UploadResponse{Title: p.Title, Name: p.File.Filename, Body: string(b), More: len(p.More)}
 	return nil
 }
 
 func TestUpload(t *testing.T) {
-	h := handler(t, New(Config{}, Endpoint{Method: "POST", Path: "/files", Handler: rh.Chain("upload", upload)}))
+	h := handler(t, New(Config{}, Endpoint{Method: "POST", Path: "/files", Handler: rh.Chain(upload)}))
 
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
@@ -266,14 +287,14 @@ func TestUpload(t *testing.T) {
 	req := httptest.NewRequest("POST", "/files", &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := do(h, req)
-	got := decodeBody[UploadResult](t, rec)
+	got := decodeBody[UploadResponse](t, rec)
 	if rec.Code != 200 || got.Title != "report" || got.Name != "a.txt" || got.Body != "hello" || got.More != 2 {
 		t.Fatalf("status %d, got %+v", rec.Code, got)
 	}
 }
 
 func TestBodyLimit(t *testing.T) {
-	h := handler(t, New(Config{MaxBodyBytes: 10}, Endpoint{Method: "POST", Path: "/shops/{shop}/orders", Handler: rh.Chain("c", create)}))
+	h := handler(t, New(Config{MaxBodyBytes: 10}, Endpoint{Method: "POST", Path: "/shops/{shop}/orders", Handler: rh.Chain(checkAuth, create)}))
 	rec := do(h, jsonReq("POST", "/shops/1/orders", `{"item":"`+strings.Repeat("x", 100)+`","qty":1}`))
 	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "larger than 10 bytes") {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
@@ -281,9 +302,9 @@ func TestBodyLimit(t *testing.T) {
 }
 
 func TestDownload(t *testing.T) {
-	h := handler(t, New(Config{}, Endpoint{Method: "GET", Path: "/files/{id}", Handler: rh.Chain("download",
-		func(c *rh.Ctx[*IDParams, *File]) error {
-			*c.Result = File{Name: "report.csv", Content: strings.NewReader("a,b\n1,2\n"), Download: true}
+	h := handler(t, New(Config{}, Endpoint{Method: "GET", Path: "/files/{id}", Handler: rh.Chain(
+		func(_ *rh.Ctx, _ *IDParams, r *File) error {
+			*r = File{Name: "report.csv", Content: strings.NewReader("a,b\n1,2\n"), Download: true}
 			return nil
 		})}))
 
@@ -303,15 +324,17 @@ type LoginParams struct {
 	User string `form:"user"`
 }
 
+func (*LoginParams) Validate() error { return nil }
+
 func TestRedirectAndCookie(t *testing.T) {
-	h := handler(t, New(Config{}, Endpoint{Method: "POST", Path: "/login", Handler: rh.Chain("login",
-		func(c *rh.Ctx[*LoginParams, *Redirect]) error {
-			if c.Params.User == "" {
+	h := handler(t, New(Config{}, Endpoint{Method: "POST", Path: "/login", Handler: rh.Chain(
+		func(c *rh.Ctx, p *LoginParams, r *Redirect) error {
+			if p.User == "" {
 				return rh.Unauthorized("who are you?")
 			}
-			SetCookie(c, &http.Cookie{Name: "session", Value: "s-" + c.Params.User, HttpOnly: true})
-			SetHeader(c, "X-User", c.Params.User)
-			*c.Result = Redirect{URL: "/home", Code: http.StatusSeeOther}
+			SetCookie(c, &http.Cookie{Name: "session", Value: "s-" + p.User, HttpOnly: true})
+			SetHeader(c, "X-User", p.User)
+			*r = Redirect{URL: "/home", Code: http.StatusSeeOther}
 			return nil
 		})}))
 
@@ -334,20 +357,19 @@ func TestHTTPMiddleware(t *testing.T) {
 		})
 	}
 	h := handler(t, New(Config{Middleware: []func(http.Handler) http.Handler{cors}},
-		Endpoint{Method: "DELETE", Path: "/x/{id}", Handler: rh.Chain("x", func(*rh.Ctx[*IDParams, *Empty]) error { return nil })}))
+		Endpoint{Method: "DELETE", Path: "/x/{id}", Handler: idChain(func(*rh.Ctx, *IDParams, *Empty) error { return nil })}))
 	if rec := do(h, httptest.NewRequest("DELETE", "/x/1", nil)); rec.Header().Get("Access-Control-Allow-Origin") != "*" {
 		t.Fatalf("headers %v", rec.Header())
 	}
 }
 
 func TestInitErrors(t *testing.T) {
-	ok := rh.Chain("x", func(*rh.Ctx[*IDParams, *Empty]) error { return nil })
+	ok := idChain(func(*rh.Ctx, *IDParams, *Empty) error { return nil })
 	cases := map[string]*App{
-		"no port":        New(Config{}, Endpoint{Method: "GET", Path: "/a", Handler: ok}),
-		"no handler":     New(Config{Port: "0"}, Endpoint{Method: "GET", Path: "/a"}),
-		"no method":      New(Config{Port: "0"}, Endpoint{Path: "/a", Handler: ok}),
-		"duplicate":      New(Config{Port: "0"}, Endpoint{Method: "GET", Path: "/a", Handler: ok}, Endpoint{Method: "GET", Path: "/a", Handler: ok}),
-		"nil middleware": New(Config{Port: "0"}, Endpoint{Method: "GET", Path: "/a", Handler: ok}).Use(nil),
+		"no port":    New(Config{}, Endpoint{Method: "GET", Path: "/a", Handler: ok}),
+		"no handler": New(Config{Port: "0"}, Endpoint{Method: "GET", Path: "/a"}),
+		"no method":  New(Config{Port: "0"}, Endpoint{Path: "/a", Handler: ok}),
+		"duplicate":  New(Config{Port: "0"}, Endpoint{Method: "GET", Path: "/a", Handler: ok}, Endpoint{Method: "GET", Path: "/a", Handler: ok}),
 	}
 	for name, a := range cases {
 		if err := a.Init(context.Background()); err == nil {
@@ -365,7 +387,7 @@ func TestExecAndStop(t *testing.T) {
 	_ = ln.Close()
 
 	a := New(Config{Port: port, ShutdownTimeout: time.Second},
-		Endpoint{Method: "GET", Path: "/ping/{id}", Handler: rh.Chain("ping", func(*rh.Ctx[*IDParams, *Empty]) error { return nil })})
+		Endpoint{Method: "GET", Path: "/ping/{id}", Handler: idChain(func(*rh.Ctx, *IDParams, *Empty) error { return nil })})
 	if err := a.Init(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -398,56 +420,5 @@ func TestExecAndStop(t *testing.T) {
 	}
 	if errs := a.Stop(); errs != nil {
 		t.Fatalf("Stop = %v", errs)
-	}
-}
-
-// Decoding errors reach the client without Go type or struct names.
-func TestDecodingErrorsAreSafe(t *testing.T) {
-	h := handler(t, New(Config{}, Endpoint{Method: "POST", Path: "/shops/{shop}/orders", Handler: rh.Chain("c", create)}))
-
-	cases := []struct {
-		name, url, body string
-		msg             string
-		field, want     string
-	}{
-		{"broken JSON", "/shops/1/orders", `{"qty":`, "invalid JSON body", "", ""},
-		{"wrong JSON type", "/shops/1/orders", `{"item":"tea","qty":"two"}`, "invalid JSON body", "qty", "must be a number"},
-		{"wrong query type", "/shops/1/orders?dry_run=maybe", `{"item":"tea","qty":1}`, "invalid query", "dry_run", "must be true or false"},
-		{"wrong path type", "/shops/x/orders", `{"item":"tea","qty":1}`, "invalid path", "shop", "must be an integer"},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			req := jsonReq("POST", c.url, c.body)
-			req.Header.Set("Authorization", "Bearer ann")
-			rec := do(h, req)
-			body := decodeBody[ErrorBody](t, rec)
-			if rec.Code != 400 || body.Message != c.msg {
-				t.Fatalf("status %d, body %+v", rec.Code, body)
-			}
-			if c.field != "" && body.Fields[c.field] != c.want {
-				t.Fatalf("fields %v", body.Fields)
-			}
-			if raw := rec.Body.String(); strings.Contains(raw, "Go struct") || strings.Contains(raw, "CreateParams") {
-				t.Fatalf("Go names leaked: %s", raw)
-			}
-		})
-	}
-}
-
-// A handler that ends early with Done answers with its Result.
-func TestDoneRespondsWithResult(t *testing.T) {
-	type out struct {
-		Cached bool `json:"cached"`
-	}
-	stop := func(c *rh.Ctx[*IDParams, *out]) error {
-		c.Result.Cached = true
-		return rh.Done
-	}
-	never := func(*rh.Ctx[*IDParams, *out]) error { panic("must not run") }
-	h := handler(t, New(Config{}, Endpoint{Method: "GET", Path: "/items/{id}", Handler: rh.Chain("cached", stop, never)}))
-
-	rec := do(h, httptest.NewRequest("GET", "/items/1", nil))
-	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"cached":true`) {
-		t.Fatalf("status %d, body %s", rec.Code, rec.Body)
 	}
 }

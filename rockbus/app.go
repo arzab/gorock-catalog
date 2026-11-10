@@ -47,7 +47,7 @@ type asyncJob struct {
 //	    rockbus.On("order.placed", handlers.OnOrderPlaced),
 //	)
 //	rockbus.SetDefault(app)
-//	engine.MustRegister("bus", app, rockengine.RestartPolicy{})
+//	rockengine.New(map[string]rockengine.App{"bus": app}).Run(ctx, "bus")
 type App struct {
 	cfg     Config
 	onError func(ctx context.Context, event Event, err error)

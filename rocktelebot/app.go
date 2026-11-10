@@ -22,7 +22,7 @@ import (
 //	    rocktelebot.GetHandler(tele.OnText,     onText),
 //	    rocktelebot.GetHandler(tele.OnCallback, onCallback),
 //	)
-//	engine.MustRegister("bot", app, rockengine.RestartPolicy{})
+//	rockengine.New(map[string]rockengine.App{"bot": app}).Run(ctx, "bot")
 type App struct {
 	cfg         Config
 	middlewares []tele.MiddlewareFunc
