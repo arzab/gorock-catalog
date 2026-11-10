@@ -29,7 +29,7 @@ type CreateParams struct {
 }
 ```
 
-Binding order: JSON body, then form, query, header, path; a later source wins. Tags inside embedded structs are bound too. Conversion errors and bodies over `MaxBodyBytes` → 400.
+Binding order: JSON body, then form, query, header, path; a later source wins. Tags inside embedded structs are bound too. Bad input → 400 with a message that never names Go types: `invalid JSON body`, `invalid query`, `invalid path`, `invalid header`, `invalid form` (with the field in `fields`, e.g. `{"qty": "must be a number"}`), or `request body is larger than N bytes`.
 
 ## Result
 

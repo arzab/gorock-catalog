@@ -189,7 +189,7 @@ func TestErrors(t *testing.T) {
 		kind, msg   string
 	}{
 		{"GET", "/missing/42", 404, "not_found", "order 42 not found"},
-		{"GET", "/missing/x", 400, "invalid", `path "id": "x" is not an integer`},
+		{"GET", "/missing/x", 400, "invalid", "invalid path"},
 		{"GET", "/boom", 500, "internal", "internal error"},
 		{"GET", "/panic", 500, "internal", "internal error"},
 		{"GET", "/slow", 504, "timeout", "Gateway Timeout"},
@@ -398,5 +398,56 @@ func TestExecAndStop(t *testing.T) {
 	}
 	if errs := a.Stop(); errs != nil {
 		t.Fatalf("Stop = %v", errs)
+	}
+}
+
+// Decoding errors reach the client without Go type or struct names.
+func TestDecodingErrorsAreSafe(t *testing.T) {
+	h := handler(t, New(Config{}, Endpoint{Method: "POST", Path: "/shops/{shop}/orders", Handler: rh.Chain("c", create)}))
+
+	cases := []struct {
+		name, url, body string
+		msg             string
+		field, want     string
+	}{
+		{"broken JSON", "/shops/1/orders", `{"qty":`, "invalid JSON body", "", ""},
+		{"wrong JSON type", "/shops/1/orders", `{"item":"tea","qty":"two"}`, "invalid JSON body", "qty", "must be a number"},
+		{"wrong query type", "/shops/1/orders?dry_run=maybe", `{"item":"tea","qty":1}`, "invalid query", "dry_run", "must be true or false"},
+		{"wrong path type", "/shops/x/orders", `{"item":"tea","qty":1}`, "invalid path", "shop", "must be an integer"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := jsonReq("POST", c.url, c.body)
+			req.Header.Set("Authorization", "Bearer ann")
+			rec := do(h, req)
+			body := decodeBody[ErrorBody](t, rec)
+			if rec.Code != 400 || body.Message != c.msg {
+				t.Fatalf("status %d, body %+v", rec.Code, body)
+			}
+			if c.field != "" && body.Fields[c.field] != c.want {
+				t.Fatalf("fields %v", body.Fields)
+			}
+			if raw := rec.Body.String(); strings.Contains(raw, "Go struct") || strings.Contains(raw, "CreateParams") {
+				t.Fatalf("Go names leaked: %s", raw)
+			}
+		})
+	}
+}
+
+// A handler that ends early with Done answers with its Result.
+func TestDoneRespondsWithResult(t *testing.T) {
+	type out struct {
+		Cached bool `json:"cached"`
+	}
+	stop := func(c *rh.Ctx[*IDParams, *out]) error {
+		c.Result.Cached = true
+		return rh.Done
+	}
+	never := func(*rh.Ctx[*IDParams, *out]) error { panic("must not run") }
+	h := handler(t, New(Config{}, Endpoint{Method: "GET", Path: "/items/{id}", Handler: rh.Chain("cached", stop, never)}))
+
+	rec := do(h, httptest.NewRequest("GET", "/items/1", nil))
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"cached":true`) {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body)
 	}
 }
