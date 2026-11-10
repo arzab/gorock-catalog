@@ -19,7 +19,7 @@ Modules marked "as moved" are the gorock-kit `v0.2.0` code under new module path
 go get github.com/arzab/gorock-catalog/rockhttp
 ```
 
-All modules share one version; tags are per module (`rockhttp/v0.1.0`, …).
+All modules share one version, aligned with gorock-kit: catalog `v0.5.0` goes with core `v0.5.0`. Tags are per module (`rockhttp/v0.5.0`, …).
 
 ## Development
 
