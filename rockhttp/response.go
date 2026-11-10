@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// File is a result that streams a file instead of JSON. Use it as the
-// route's result type: rockhandlers.Handler[*Params, *rockhttp.File].
+// File is a response that streams a file instead of JSON. Use it as the
+// chain's response type: func(c *rockhandlers.Ctx, p *Params, r *rockhttp.File) error.
 type File struct {
 	Name        string    // download name; sets Content-Disposition when Download is true
 	ContentType string    // default: detected from Name, else application/octet-stream
@@ -17,11 +17,17 @@ type File struct {
 	Download    bool      // ask the browser to save instead of display
 }
 
-// Redirect is a result that redirects. Use it as the handler's Out.
+// Redirect is a response that redirects. Use it as the chain's response type.
 type Redirect struct {
 	URL  string
 	Code int // default 302 Found
 }
+
+// Normalize lets File be a rockhandlers.Response.
+func (f *File) Normalize() error { return nil }
+
+// Normalize lets Redirect be a rockhandlers.Response.
+func (r *Redirect) Normalize() error { return nil }
 
 // --- request-scoped access, for what the typed result can't express ---
 

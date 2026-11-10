@@ -3,6 +3,7 @@ package rockhttp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -52,6 +53,11 @@ type ErrorBody struct {
 
 func (a *App) writeError(ctx context.Context, w http.ResponseWriter, err error) {
 	applyExtras(ctx, w)
+	if errors.Is(err, rockhandlers.ErrHandlerNotFound) { // a chain without handlers yet
+		code := http.StatusNotImplemented
+		_ = writeJSON(w, code, ErrorBody{Code: code, Status: http.StatusText(code), Kind: "not_implemented", Message: http.StatusText(code)})
+		return
+	}
 	kind := rockhandlers.KindOf(err)
 	code := StatusOf(kind)
 	if kind == rockhandlers.KindCanceled {

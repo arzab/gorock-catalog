@@ -6,14 +6,14 @@ HTTP transport for [rockhandlers](https://github.com/arzab/gorock-kit/tree/main/
 
 ```go
 server := rockhttp.New(cfg.HTTP,
-    rockhttp.Endpoint{Method: "POST", Path: "/shops/{shop}/orders", Handler: orders.Create, Status: http.StatusCreated},
-    rockhttp.Endpoint{Method: "GET", Path: "/orders/{id}", Handler: orders.Get},
-    rockhttp.Endpoint{Method: "GET", Path: "/files/{id}", Handler: files.Download}, // R = *rockhttp.File
+    rockhttp.Endpoint{Method: "POST", Path: "/tasks", Handler: tasks.Create, Status: http.StatusCreated},
+    rockhttp.Endpoint{Method: "GET", Path: "/tasks/{id}", Handler: tasks.Get},
+    rockhttp.Endpoint{Method: "GET", Path: "/files/{id}", Handler: files.Download}, // response type *rockhttp.File
 ).Use(Log) // rockhandlers middlewares around every endpoint
 engine.MustRegister("http", server)
 ```
 
-`Handler` is a `rockhandlers.Route` (`rockhandlers.Chain(...)`): the steps know nothing about HTTP.
+`Handler` is a chain, `rockhandlers.Chain(handlers...)`: the handlers know nothing about HTTP. An empty chain (a skeleton) answers `501 Not Implemented`.
 
 ## Params
 
@@ -31,15 +31,15 @@ type CreateParams struct {
 
 Binding order: JSON body, then form, query, header, path; a later source wins. Tags inside embedded structs are bound too. Bad input → 400 with a message that never names Go types: `invalid JSON body`, `invalid query`, `invalid path`, `invalid header`, `invalid form` (with the field in `fields`, e.g. `{"qty": "must be a number"}`), or `request body is larger than N bytes`.
 
-## Result
+## Response
 
-| Result type `R` | Response |
+| Response type | HTTP response |
 |---|---|
 | struct with fields | JSON; status from `Endpoint.Status`, default 200 |
 | empty struct | 204 (or `Endpoint.Status`) |
 | `*rockhttp.File` | file stream; ranges and `If-Modified-Since` when `Content` is an `io.ReadSeeker`; `Download: true` → attachment |
 | `*rockhttp.Redirect` | redirect, 302 by default |
-| error | `ErrorBody{code, status, kind, message, fields}`; Internal messages are hidden |
+| error | `ErrorBody{code, status, kind, message, fields}`; Internal messages are hidden; a chain without handlers → 501 |
 
 Error kind → HTTP status:
 
@@ -57,7 +57,7 @@ Error kind → HTTP status:
 
 `StatusOf` exposes this mapping.
 
-What a typed result can't express goes through the context:
+What a typed response can't express goes through the context:
 - `rockhttp.SetCookie(c, cookie)`;
 - `rockhttp.SetHeader(c, k, v)`;
 - `rockhttp.Request(c)` — the raw request, as an escape hatch.
